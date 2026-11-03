@@ -1,0 +1,19 @@
+random_seed: 42
+
+test_size: 0.20
+
+cv_folds: 5
+
+decision_threshold: 0.50
+
+minimum_malignant_recall: 0.95
+
+models:
+  logistic_regression:
+    C: 1.0
+    max_iter: 2000
+
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 2
