@@ -199,7 +199,13 @@ def main():
 
     with open(output_dir / "model_card.json", "w") as file:
         json.dump(model_card, file, indent=4)
+        metrics_data = {
+        "selected_model": best_model_name,
+        "models": results
+    }
 
+    with open(output_dir / "metrics.json", "w") as file:
+        json.dump(metrics_data, file, indent=4)
     print("Selected model:", best_model_name)
     print("Mean CV malignant recall:", best_recall)
     print("Test malignant recall:", selected_test["malignant_recall"])
