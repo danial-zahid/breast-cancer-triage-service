@@ -1,0 +1,36 @@
+
+FROM ubuntu:24.04
+
+# Install Python, pip, and virtual environment support
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create Python virtual environment
+RUN python3 -m venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# Copy the project into the image
+COPY . .
+
+# Install training and serving dependencies
+RUN pip install --no-cache-dir \
+    -r requirements-train.txt \
+    -r requirements-serve.txt
+
+# Train the model during image build
+RUN python training/train.py \
+    --data-path data/raw/breast_cancer.csv \
+    --output-dir artifacts \
+    --model-version 1.0.0
+
+# Expose API port
+EXPOSE 8000
+
+# Start FastAPI server
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
