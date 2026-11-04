@@ -8,8 +8,10 @@ from pathlib import Path
 import joblib
 import pandas as pd
 import sklearn
+import redis
+from redis.exceptions import RedisError
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -25,18 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 # Environment configuration
-MODEL_PATH = os.getenv(
-    "MODEL_PATH",
-    "artifacts/model.joblib"
-)
+MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/model.joblib")
 
 DECISION_THRESHOLD = float(
     os.getenv("DECISION_THRESHOLD", "0.5")
 )
 
 MODEL_VERSION_ENV = os.getenv("MODEL_VERSION", "")
-
 GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
+REDIS_HOST = os.getenv("REDIS_HOST", "").strip()
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 
 # All 30 dataset features
@@ -112,29 +113,28 @@ class PredictionInput(BaseModel):
     worst_fractal_dimension: float = Field(ge=0)
 
 
-# Model and metadata are loaded once at startup
+# Model and Redis client
 model = None
 model_card = None
+redis_client = None
 prediction_count = 0
+
+REDIS_COUNTER_KEY = "prediction_count"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, model_card
+    global model, model_card, redis_client
 
     model_file = Path(MODEL_PATH)
 
     if not model_file.is_file():
-        raise RuntimeError(
-            f"Model file not found: {MODEL_PATH}"
-        )
+        raise RuntimeError(f"Model file not found: {MODEL_PATH}")
 
     card_file = model_file.parent / "model_card.json"
 
     if not card_file.is_file():
-        raise RuntimeError(
-            f"Model card not found: {card_file}"
-        )
+        raise RuntimeError(f"Model card not found: {card_file}")
 
     model = joblib.load(model_file)
 
@@ -142,9 +142,7 @@ async def lifespan(app: FastAPI):
         model_card = json.load(file)
 
     if model_card.get("feature_names") != FEATURE_NAMES:
-        raise RuntimeError(
-            "Model feature names do not match API features"
-        )
+        raise RuntimeError("Model feature names do not match API features")
 
     if len(FEATURE_NAMES) != 30:
         raise RuntimeError("Expected exactly 30 features")
@@ -152,7 +150,23 @@ async def lifespan(app: FastAPI):
     logger.info("Model loaded successfully")
     logger.info("Model version: %s", model_card["model_version"])
 
+    # Configure Redis only when REDIS_HOST is provided
+    if REDIS_HOST:
+        redis_client = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1
+        )
+        logger.info("Redis configured: %s:%s", REDIS_HOST, REDIS_PORT)
+    else:
+        logger.info("Redis is not configured. Using local counter.")
+
     yield
+
+    if redis_client is not None:
+        redis_client.close()
 
     logger.info("API shutting down")
 
@@ -176,7 +190,6 @@ def predict(data: PredictionInput):
 
     input_data = data.model_dump()
 
-    # Preserve the exact training feature order
     input_df = pd.DataFrame(
         [[input_data[name] for name in FEATURE_NAMES]],
         columns=FEATURE_NAMES
@@ -196,12 +209,22 @@ def predict(data: PredictionInput):
         else "benign"
     )
 
+    # Local counter is maintained as a fallback
     prediction_count += 1
 
-    logger.info(
-        "Prediction completed: label=%s",
-        label
-    )
+    # Increment Redis counter when Redis is configured
+    if redis_client is not None:
+        try:
+            current_count = redis_client.incr(REDIS_COUNTER_KEY)
+            logger.info("Redis prediction count: %s", current_count)
+
+        except RedisError as error:
+            logger.warning(
+                "Redis unavailable. Prediction served without Redis: %s",
+                error
+            )
+
+    logger.info("Prediction completed: label=%s", label)
 
     return {
         "label": label,
@@ -226,7 +249,29 @@ def model_info():
 
 @app.get("/stats")
 def stats():
+    # Use Redis count when Redis is configured
+    if redis_client is not None:
+        try:
+            count = redis_client.get(REDIS_COUNTER_KEY)
+
+            return {
+                "prediction_count": int(count) if count else 0,
+                "storage": "redis",
+                "redis_available": True
+            }
+
+        except RedisError as error:
+            logger.warning("Could not read Redis statistics: %s", error)
+
+            return {
+                "prediction_count": prediction_count,
+                "storage": "local_fallback",
+                "redis_available": False
+            }
+
+    # Local counter when REDIS_HOST is not configured
     return {
         "prediction_count": prediction_count,
-        "message": "Redis-based persistent statistics will be implemented in Milestone 4"
+        "storage": "local",
+        "redis_available": False
     }
